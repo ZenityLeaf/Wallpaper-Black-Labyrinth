@@ -59,6 +59,9 @@ const P = {
   scale:   num('scale', 1, 0.25, 2),        // Renderauflösung relativ zum Display
   seed:    parseSeed(),                     // gleiches Muster bei gleichem Seed
   freeze:  has('freeze') ? num('freeze', 12, 0, 1e6) : null, // Standbild nach x Sekunden
+  egg:     Q.get('egg') === 'test' ? 12.5 : num('egg', 12.5, 0, 1440), // Easter Egg: Minuten (Mittelwert, 0 = aus)
+  eggTest: Q.get('egg') === 'test',         // Easter Egg sofort nach dem Start zeigen
+  name:    (Q.get('name') || 'ZenityLeaf').slice(0, 24),
 };
 if (P.speed === 0 && P.freeze === null) P.freeze = 8;
 
@@ -118,6 +121,11 @@ uniform vec3  uRimTint;
 uniform float uGain;      // Helligkeit * Einblendung
 uniform float uLine;
 uniform float uLineW;     // Linienbreite (Sigma, Pixel)
+uniform sampler2D uText;  // Distanzfeld des Namens (Gerätepixel)
+uniform vec4  uTextBox;   // Position und Größe des Schriftfelds
+uniform float uTextT;     // halbe Strichstärke
+uniform vec4  uEggRect;   // Freiraum: Mitte, halbe Größe
+uniform vec4  uEgg;       // (freiräumen, Schrift, Glanzposition, Glanzstärke)
 
 out vec4 outColor;
 
@@ -236,6 +244,12 @@ void main() {
     F = smin3(fO, fN);
   }
 
+  if (uEgg.x > 0.0) {
+    vec2 rq = abs(p - uEggRect.xy) - uEggRect.zw + uEggRect.w;
+    float rb = length(max(rq, 0.0)) + min(max(rq.x, rq.y), 0.0) - uEggRect.w;
+    F.x += 1.6 * uEgg.x * (1.0 - smoothstep(-0.2 * uS, 0.8 * uS, rb));
+  }
+
   float sd   = F.x - 0.5;               // < 0: Band, > 0: Zwischenraum
   float sdPx = sd * uS;
   vec2  g    = F.yz;
@@ -256,6 +270,33 @@ void main() {
   float edge = KEY * ckL * sqrt(ckL) + PT * att * cpL * sqrt(cpL);
   float rim  = (RIM0 + RIM1 * edge) * exp(-0.5 * sdPx * sdPx / (uLineW * uLineW)) * uLine;
 
+  if (uEgg.y > 0.0) {
+    vec2 uv = (p - uTextBox.xy) / uTextBox.zw;
+    if (uv.x > 0.0 && uv.y > 0.0 && uv.x < 1.0 && uv.y < 1.0) {
+      vec2 tsz = vec2(textureSize(uText, 0));
+      vec2 e   = 1.0 / tsz;
+      float px = uTextBox.z / tsz.x;
+      float t  = texture(uText, uv).r;
+      vec2 tg  = vec2(texture(uText, uv + vec2(e.x, 0.0)).r - texture(uText, uv - vec2(e.x, 0.0)).r,
+                      texture(uText, uv + vec2(0.0, e.y)).r - texture(uText, uv - vec2(0.0, e.y)).r) / (2.0 * px);
+      float tl = length(tg);
+      if (tl > 1.0) tg /= tl;
+      vec2 tgn = tl > 1e-5 ? tg / tl : vec2(0.0);
+      float tt  = t + (1.0 - uEgg.y) * uTextT * 2.4;   // Buchstaben wachsen aus ihrer Mitte
+      float vL  = 1.0 - min(abs(0.5 * tt / uTextT), 0.5) * 2.0;
+      float aL  = 1.0 - smoothstep(-0.75, 0.75, tt);
+      float sx  = (uv.x - uEgg.z) / 0.07;
+      float shine = 1.0 + 2.5 * uEgg.w * exp(-sx * sx);
+      float litL = mix(flank(-tg, vL, att, ld), flank(tg, vL, att, ld), aL);
+      float c1 = abs(dot(tgn, uKey)), c2 = abs(dot(tgn, ld));
+      float edgeL = KEY * c1 * sqrt(c1) + PT * att * c2 * sqrt(c2);
+      float rimL = (RIM0 * 2.5 + RIM1 * edgeL) * exp(-0.5 * tt * tt / (uLineW * uLineW)) * uLine;
+      float wv = smoothstep(0.0, 0.15, uEgg.y);
+      lit += 1.5 * litL * wv * (1.0 + 0.6 * (shine - 1.0));
+      rim += 1.7 * rimL * wv * shine;
+    }
+  }
+
   vec3 col = (uTint * lit + uRimTint * rim) * uGain;
   col = col / (1.0 + 0.5 * col);
 
@@ -274,9 +315,10 @@ const gl = canvas.getContext('webgl2', {
 });
 if (!gl) { msg.style.display = 'flex'; return; }
 
-let prog = null, vao = null, tex = null, U = {}, maxDims = [8192, 8192];
+let prog = null, vao = null, tex = null, textTex = null, U = {}, maxDims = [8192, 8192];
 const UNIFORMS = ['uRes', 'uOrigin', 'uS', 'uMask', 'uGrid', 'uMorph', 'uT', 'uDur', 'uFront', 'uWob',
-  'uKey', 'uPL', 'uTint', 'uRimTint', 'uGain', 'uLine', 'uLineW'];
+  'uKey', 'uPL', 'uTint', 'uRimTint', 'uGain', 'uLine', 'uLineW',
+  'uText', 'uTextBox', 'uTextT', 'uEggRect', 'uEgg'];
 
 function compile(type, src) {
   const sh = gl.createShader(type);
@@ -304,10 +346,18 @@ function setupGL() {
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  textTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, textTex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.R16F, 1, 1, 0, gl.RED, gl.HALF_FLOAT, new Uint16Array([0x5640]));
   U = {};
   for (const n of UNIFORMS) U[n] = gl.getUniformLocation(p, n);
   gl.useProgram(p);
   gl.uniform1i(U.uMask, 0);
+  gl.uniform1i(U.uText, 1);
   gl.disable(gl.DITHER);
   const md = gl.getParameter(gl.MAX_VIEWPORT_DIMS);
   if (md) maxDims = [md[0], md[1]];
@@ -426,6 +476,109 @@ function upload(a, b) {
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, nx, ny, 0, gl.RGBA, gl.UNSIGNED_BYTE, data);
 }
 
+// ---------- Easter Egg: Name als Relief ----------
+const f32 = new Float32Array(1), u32 = new Uint32Array(f32.buffer);
+function toHalf(v) {
+  f32[0] = v;
+  const x = u32[0], sign = (x >>> 16) & 0x8000, e = ((x >>> 23) & 0xff) - 112;
+  if (e <= 0) return sign;
+  if (e >= 31) return sign | 0x7bff;
+  return sign | (e << 10) | ((x & 0x7fffff) >>> 13);
+}
+
+// exakte euklidische Distanztransformation (Felzenszwalb & Huttenlocher)
+function edt1d(g, off, stride, n, f, v, z) {
+  v[0] = 0; z[0] = -1e20; z[1] = 1e20; f[0] = g[off];
+  for (let q = 1, k = 0, s = 0; q < n; q++) {
+    f[q] = g[off + q * stride];
+    const q2 = q * q;
+    do { const r = v[k]; s = (f[q] - f[r] + q2 - r * r) / (q - r) / 2; } while (s <= z[k] && --k > -1);
+    k++; v[k] = q; z[k] = s; z[k + 1] = 1e20;
+  }
+  for (let q = 0, k = 0; q < n; q++) {
+    while (z[k + 1] < q) k++;
+    const r = v[k], d = q - r;
+    g[off + q * stride] = f[r] + d * d;
+  }
+}
+function edt(g, w, h) {
+  const n = Math.max(w, h), f = new Float64Array(n), v = new Uint32Array(n), z = new Float64Array(n + 1);
+  for (let x = 0; x < w; x++) edt1d(g, x, w, h, f, v, z);
+  for (let y = 0; y < h; y++) edt1d(g, y * w, 1, w, f, v, z);
+}
+
+function buildText(W, H, s) {
+  const font = f => `800 ${f}px ui-rounded, "SF Pro Rounded", "Arial Rounded MT Bold", "Nunito", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif`;
+  let F = 0.8 * s;
+  const mc = document.createElement('canvas').getContext('2d');
+  mc.font = font(F);
+  let tw = mc.measureText(P.name).width;
+  if (tw > 0.72 * W) { F *= 0.72 * W / tw; tw = 0.72 * W; }
+  const pad = 0.45 * F, bw = tw + 2 * pad, bh = 1.25 * F + 2 * pad;
+  const ts = Math.min(1, 1600 / bw);                 // Texel pro Gerätepixel
+  const w = Math.max(8, Math.round(bw * ts)), h = Math.max(8, Math.round(bh * ts));
+  const cv = document.createElement('canvas');
+  cv.width = w; cv.height = h;
+  const cx = cv.getContext('2d');
+  cx.font = font(F * ts);
+  cx.textAlign = 'center';
+  cx.textBaseline = 'middle';
+  cx.fillStyle = '#fff';
+  cx.fillText(P.name, w / 2, h / 2 + 0.04 * F * ts);
+  const img = cx.getImageData(0, 0, w, h).data;
+  const n = w * h, outer = new Float32Array(n), inner = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const a = img[i * 4 + 3] / 255;
+    if (a >= 1) { outer[i] = 0; inner[i] = 1e20; }
+    else if (a <= 0) { outer[i] = 1e20; inner[i] = 0; }
+    else { const d = 0.5 - a; outer[i] = d > 0 ? d * d : 0; inner[i] = d < 0 ? d * d : 0; }
+  }
+  edt(outer, w, h);
+  edt(inner, w, h);
+  const data = new Uint16Array(n);
+  let maxIn = 0;
+  for (let i = 0; i < n; i++) {
+    const di = Math.sqrt(inner[i]);
+    if (di > maxIn) maxIn = di;
+    data[i] = toHalf((Math.sqrt(outer[i]) - di) / ts);
+  }
+  return {
+    data, w, h,
+    box: [W / 2 - bw / 2, H / 2 - bh / 2, bw, bh],
+    T: Math.max(1, 0.75 * maxIn / ts),
+    rect: [W / 2, H / 2 + 0.05 * F, tw / 2 + 0.55 * s, 0.62 * F + 0.4 * s],
+  };
+}
+
+function uploadText() {
+  if (!L || !L.text) return;
+  const t = L.text;
+  gl.activeTexture(gl.TEXTURE1);
+  gl.bindTexture(gl.TEXTURE_2D, textTex);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.R16F, t.w, t.h, 0, gl.RED, gl.HALF_FLOAT, t.data);
+  gl.activeTexture(gl.TEXTURE0);
+}
+
+let rndE = mulberry32(P.seed ^ 0x51ED270B);
+let egg = null, nextEggAt = Infinity;
+const EGG = { clear: 2.5, rise: 2.5, hold: 10 };
+const EGG_TOTAL = 2 * (EGG.clear + EGG.rise) + EGG.hold;
+function scheduleEgg(first) {
+  if (P.egg <= 0) { nextEggAt = Infinity; return; }
+  nextEggAt = (first && P.eggTest) ? simT + 7 : simT + P.egg * 60 * (0.8 + 0.4 * rndE());
+}
+function eggState() {
+  if (!egg) return [0, 0, 0, 0];
+  const t = egg.t, c = EGG.clear, r = EGG.rise;
+  const ss = x => { x = Math.min(1, Math.max(0, x)); return x * x * (3 - 2 * x); };
+  const clear = Math.min(ss(t / c), ss((EGG_TOTAL - t) / c));
+  const rise = Math.min(ss((t - c) / r), ss((EGG_TOTAL - c - t) / r));
+  const sp = (t - c - r) / EGG.hold;
+  const shine = sp > 0 && sp < 1 ? Math.pow(Math.sin(Math.PI * sp), 2) : 0;
+  return [clear, rise, -0.15 + 1.3 * Math.min(1, Math.max(0, sp)), shine];
+}
+
 // ---------- Zeitablauf ----------
 let simT = 0, trans = null, nextMorphAt = Infinity;
 
@@ -449,13 +602,19 @@ function startIntro() {
 }
 
 function startMorph() {
-  if (!L || trans) return;
+  if (!L || trans || egg) return;
   const next = mutate(L.cur);
   beginTransition(L.cur, next, 5.0, 5.5);
 }
 
 function step(dt) {
   simT += dt;
+  if (egg) {
+    egg.t += dt;
+    if (egg.t >= EGG_TOTAL) { egg = null; scheduleEgg(false); nextMorphAt = Math.max(nextMorphAt, simT + 6); }
+  } else if (!trans && L && L.text && simT >= nextEggAt) {
+    egg = { t: 0 };
+  }
   if (trans) {
     trans.t += dt;
     if (trans.t >= trans.sweep + trans.local) {
@@ -464,7 +623,7 @@ function step(dt) {
       upload(L.cur, L.cur);
       nextMorphAt = simT + P.morph;
     }
-  } else if (P.morph > 0 && simT >= nextMorphAt) {
+  } else if (P.morph > 0 && simT >= nextMorphAt && !egg) {
     startMorph();
   }
 }
@@ -498,6 +657,17 @@ function draw() {
   gl.uniform1f(U.uGain, P.light * fade);
   gl.uniform1f(U.uLine, P.line);
   gl.uniform1f(U.uLineW, Math.max(0.9, 0.0036 * L.s));
+  const es = eggState();
+  gl.uniform4f(U.uEgg, es[0], es[1], es[2], es[3]);
+  if (L.text) {
+    const tb = L.text.box, er = L.text.rect;
+    gl.uniform4f(U.uTextBox, tb[0], tb[1], tb[2], tb[3]);
+    gl.uniform1f(U.uTextT, L.text.T);
+    gl.uniform4f(U.uEggRect, er[0], er[1], er[2], er[3]);
+  }
+  gl.activeTexture(gl.TEXTURE1);
+  gl.bindTexture(gl.TEXTURE_2D, textTex);
+  gl.activeTexture(gl.TEXTURE0);
   gl.drawArrays(gl.TRIANGLES, 0, 3);
 }
 
@@ -514,15 +684,21 @@ function applySize(w, h) {
   canvas.width = w;
   canvas.height = h;
   L = makeLayout(gl.drawingBufferWidth, gl.drawingBufferHeight);
+  egg = null;
+  if (P.egg > 0) {
+    try { L.text = buildText(L.W, L.H, L.s); uploadText(); } catch (e) { console.warn(e); L.text = null; }
+  }
   startIntro();
 }
 
 // ---------- Standbild ----------
 function renderFrozen() {
   rnd = mulberry32(P.seed);
-  simT = 0; trans = null; nextMorphAt = Infinity;
+  rndE = mulberry32(P.seed ^ 0x51ED270B);
+  simT = 0; trans = null; egg = null; nextMorphAt = Infinity;
   const [w, h] = targetSize();
   applySize(w, h);
+  scheduleEgg(true);
   for (let t = 0; t < P.freeze - 1e-9;) {
     const dt = Math.min(0.25, P.freeze - t);
     step(dt);
@@ -547,7 +723,7 @@ function frame(now) {
   if (!running) return;
   raf = requestAnimationFrame(frame);
   checkSize(now);
-  const active = !!trans || simT < 2;
+  const active = !!trans || !!egg || simT < 2;
   const gap = 1000 / (active ? P.fps : P.idle);
   if (lastDraw >= 0 && now - lastDraw < gap - 1.5) return;
   const dt = lastDraw < 0 ? 0 : Math.min((now - lastDraw) / 1000, 0.1);
@@ -566,6 +742,7 @@ canvas.addEventListener('webglcontextrestored', () => {
   setupGL();
   if (P.freeze !== null) { renderFrozen(); return; }
   if (L && uploaded) upload(uploaded[0], uploaded[1]);
+  uploadText();
   running = true;
   lastDraw = -1;
   raf = requestAnimationFrame(frame);
@@ -586,6 +763,7 @@ if (P.freeze !== null) {
   window.addEventListener('resize', () => { clearTimeout(tid); tid = setTimeout(renderFrozen, 250); });
 } else {
   window.addEventListener('pointerdown', () => startMorph());
+  scheduleEgg(true);
   raf = requestAnimationFrame(frame);
 }
 })();
